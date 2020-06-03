@@ -11,7 +11,6 @@ import scala.tools.nsc.transform.{Transform, TypingTransformers}
 
 /** @author Stephen Samuel */
 class ScoveragePlugin(val global: Global) extends Plugin {
-
   override val name: String = "scoverage"
   override val description: String = "scoverage code coverage compiler plugin"
   private val (extraAfterPhase, extraBeforePhase) = processPhaseOptions(pluginOptions)
@@ -35,17 +34,31 @@ class ScoveragePlugin(val global: Global) extends Plugin {
         options.dataDir = opt.substring("dataDir:".length)
       } else if (opt.startsWith("extraAfterPhase:") || opt.startsWith("extraBeforePhase:")) {
         // skip here, these flags are processed elsewhere
-      } else {
+      } else if (opt.startsWith("writeToClasspath:")) {
+        try {
+          options.writeToClasspath = opt.substring("writeToClasspath:".length).toBoolean
+        } catch {
+          case _: IllegalArgumentException => throw new RuntimeException("writeToClasspath can only be a boolean value: true or false")
+          case e: Exception => throw e
+        }
+      } else{
         error("Unknown option: " + opt)
       }
     }
+
     if (!opts.exists(_.startsWith("dataDir:")))
       throw new RuntimeException("Cannot invoke plugin without specifying <dataDir>")
+
     instrumentationComponent.setOptions(options)
   }
 
   override val optionsHelp: Option[String] = Some(Seq(
-    "-P:scoverage:dataDir:<pathtodatadir>                  where the coverage files should be written\n",
+    "-P:scoverage:writeToClasspath:<boolean>               if true, use the system property variable [scoverage_measurement_path] " +
+                                                           "to store measurements and store instruments file to the output classpath " +
+                                                           "where compiler emits classfiles. " +
+                                                           "Uses dataDir to create a targetId and then overrides the datadir with the output classpath.",
+
+    "-P:scoverage:dataDir:<pathtodatadir>                  where the coverage files should be written\n Acts as a targteId in case [writeToClasspath] is true",
     "-P:scoverage:excludedPackages:<regex>;<regex>         semicolon separated list of regexs for packages to exclude",
     "-P:scoverage:excludedFiles:<regex>;<regex>            semicolon separated list of regexs for paths to exclude",
     "-P:scoverage:excludedSymbols:<regex>;<regex>          semicolon separated list of regexs for symbols to exclude",
@@ -82,6 +95,16 @@ class ScoverageOptions {
   var excludedFiles: Seq[String] = Nil
   var excludedSymbols: Seq[String] = Seq("scala.reflect.api.Exprs.Expr", "scala.reflect.api.Trees.Tree", "scala.reflect.macros.Universe.Tree")
   var dataDir: String = IOUtils.getTempPath
+
+  // Adding additional option for https://github.com/scoverage/scalac-scoverage-plugin/issues/265
+  // If the option is false, scoverage works the usual way.
+  // If the option is true, the instrument files [scoverage.coverage] are stored on to the classpath and
+  // the measurement files are written to the directory specified by the system property
+  // `scoverage_measurement_path`. Setting [writeToClasspath] to true creates a `targetId`
+  // out of the given value of [dataDir] and overrides the [dataDir] to point
+  // to the output classpath of the compiler.
+  // By default, the option is set to false.
+  var writeToClasspath: Boolean = false
 }
 
 class ScoverageInstrumentationComponent(val global: Global, extraAfterPhase: Option[String], extraBeforePhase: Option[String])
@@ -107,10 +130,49 @@ class ScoverageInstrumentationComponent(val global: Global, extraAfterPhase: Opt
   private var options: ScoverageOptions = new ScoverageOptions()
   private var coverageFilter: CoverageFilter = AllCoverageFilter
 
+  // This [targetId] is used below in case [writeToClasspath] option
+  // is true. It is created using the option given in [dataDir]. It is used for:
+  // 1. Creating a subdir under the classpath to store the instrument files, i.e
+  //    path to instrument files will be `< classpath >/META-INF/scoverage/< targetId >/scoverage.coverage`
+  // 2. Instrumenting the binaries with the [targetId], i.e binaries will be instrumented with
+  //    `Invoker.invokedWriteToClasspath(< statement id >, < targetId >)`
+  //    Consequently, at runtime, we can get the "correct" instrument file located at `.../< targetId >/scoverage.coverage`
+  //    from the classpath and store it with its appropriate measurements file.
+  // NOTE: It is on user to provide unique value of targetIds by setting the [dataDir] option
+  // uniquely for every target in case [writeToClasspath] is true.
+  private var targetId: String = ""
+
+  // Checks if [path] is a relative path.
+  def validateRelativePath(path: String): String = {
+    val tmp: File = new File(path)
+    if (tmp.isAbsolute){
+      throw new RuntimeException("dataDir must be a relative path in case writeToClasspath is true")
+    }else {
+      path
+    }
+  }
+
   def setOptions(options: ScoverageOptions): Unit = {
+
     this.options = options
+
+    // If [writeToClasspath] is true:
+    // 1. set targetId to relative path specified by options.dataDir
+    // 2. override options.dataDir to point to output classpath.
+    if(options.writeToClasspath){
+      settings.outputDirs.getSingleOutput match {
+        case Some(dest) =>
+          //creating targetId out of [dataDir]
+          targetId = validateRelativePath(options.dataDir)
+          // Overriding [dataDir] to `< classpath >/META-INF/scoverage/< targetId >`.
+          // This is where the instrument file [scoverage.coverage] for this target will now be stored.
+          options.dataDir = s"${dest.toString()}/${Constants.ClasspathSubdir}/$targetId"
+        case None => throw new RuntimeException("No output classpath specified.")
+      }
+    }
     coverageFilter = new RegexCoverageFilter(options.excludedPackages, options.excludedFiles, options.excludedSymbols)
     new File(options.dataDir).mkdirs() // ensure data directory is created
+
   }
 
   override def newPhase(prev: scala.tools.nsc.Phase): Phase = new Phase(prev) {
@@ -128,7 +190,16 @@ class ScoverageInstrumentationComponent(val global: Global, extraAfterPhase: Opt
 
       Serializer.serialize(coverage, Serializer.coverageFile(options.dataDir))
       reporter.echo(s"Wrote instrumentation file [${Serializer.coverageFile(options.dataDir)}]")
-      reporter.echo(s"Will write measurement data to [${options.dataDir}]")
+
+      // Measurements are not necessarily written to
+      // [options.dataDir] in case [writeToClasspath] is set to true.
+      if(!options.writeToClasspath) {
+        reporter.echo(s"Will write measurement data to [${ options.dataDir }]")
+      }
+      else {
+        reporter.echo(s"Will write measurements data to the directory specified by system" +
+          s" variable scoverage_measurement_path at runtime.")
+      }
     }
   }
 
@@ -152,6 +223,24 @@ class ScoverageInstrumentationComponent(val global: Global, extraAfterPhase: Opt
     def safeLine(tree: Tree): Int = if (tree.pos.isDefined) tree.pos.line else -1
     def safeSource(tree: Tree): Option[SourceFile] = if (tree.pos.isDefined) Some(tree.pos.source) else None
 
+    var termName: String = ""
+    var secondArg: String = ""
+    if (options.writeToClasspath){
+      /**
+       * We pass in [targetId] as one of the instruments with
+       * [invokedUseEnvironment] as it helps in
+       * 1. grabbing the "correct" instruments file from the classpath at runtime.
+       * 2. creating a unique subdir for each target at runtime.
+       * iff targetIds are unique per target.
+       */
+      termName = "invokedWriteToClasspath"
+      secondArg = targetId
+    }
+    else{
+      termName = "invoked"
+      secondArg = options.dataDir
+    }
+
     def invokeCall(id: Int): Tree = {
       Apply(
         Select(
@@ -159,14 +248,14 @@ class ScoverageInstrumentationComponent(val global: Global, extraAfterPhase: Opt
             Ident("scoverage"),
             newTermName("Invoker")
           ),
-          newTermName("invoked")
+          newTermName(termName)
         ),
         List(
           Literal(
             Constant(id)
           ),
           Literal(
-            Constant(options.dataDir)
+            Constant(secondArg)
           )
         )
       )
@@ -288,6 +377,7 @@ class ScoverageInstrumentationComponent(val global: Global, extraAfterPhase: Opt
     def allConstArgs(args: List[Tree]) = args.forall(arg => arg.isInstanceOf[Literal] || arg.isInstanceOf[Ident])
 
     def process(tree: Tree): Tree = {
+
       tree match {
 
         //        // non ranged inside ranged will break validation after typer, which only kicks in for yrangepos.
